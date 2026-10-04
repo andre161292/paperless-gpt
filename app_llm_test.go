@@ -455,7 +455,8 @@ type mockPaperlessClient struct {
 	// ReferenceMatches maps a reference to the document ids
 	// FindDocumentIDsByReference returns for it.
 	ReferenceMatches map[string][]int
-	ReferenceError   error
+	// ReferenceErrors maps a reference to the error its lookup fails with.
+	ReferenceErrors  map[string]error
 	ReferenceLookups []string
 }
 
@@ -485,10 +486,13 @@ func (m *mockPaperlessClient) GetDocumentThumbnail(ctx context.Context, document
 func (m *mockPaperlessClient) SearchDocuments(ctx context.Context, query string, pageSize int) ([]Document, error) {
 	return nil, nil
 }
+
+// FindDocumentIDsByReference records the lookup and answers it from
+// ReferenceMatches and ReferenceErrors, capped at limit like the real client.
 func (m *mockPaperlessClient) FindDocumentIDsByReference(ctx context.Context, reference string, limit int) ([]int, error) {
 	m.ReferenceLookups = append(m.ReferenceLookups, reference)
-	if m.ReferenceError != nil {
-		return nil, m.ReferenceError
+	if err := m.ReferenceErrors[reference]; err != nil {
+		return nil, err
 	}
 	ids := m.ReferenceMatches[reference]
 	if len(ids) > limit {
@@ -622,7 +626,7 @@ func TestGetSuggestedCustomFields_DocumentLink(t *testing.T) {
 		name             string
 		llmValue         string
 		referenceMatches map[string][]int
-		referenceError   error
+		referenceErrors  map[string]error
 		wantLinks        []int // nil: the field is not suggested at all
 	}{
 		{
@@ -676,9 +680,17 @@ func TestGetSuggestedCustomFields_DocumentLink(t *testing.T) {
 			referenceMatches: map[string][]int{"12": {412}},
 		},
 		{
-			name:           "lookup error drops the reference instead of failing",
-			llmValue:       `["R10927801"]`,
-			referenceError: fmt.Errorf("paperless-ngx unavailable"),
+			name:            "lookup error omits the field instead of failing the document",
+			llmValue:        `["R10927801"]`,
+			referenceErrors: map[string]error{"R10927801": fmt.Errorf("paperless-ngx unavailable")},
+		},
+		{
+			// A partial list would overwrite existing links in write modes
+			// "update" and "replace".
+			name:             "one failed lookup omits the field even if others resolved",
+			llmValue:         `["R10927801", "V-2026-17"]`,
+			referenceMatches: map[string][]int{"R10927801": {412}},
+			referenceErrors:  map[string]error{"V-2026-17": errReferenceSearchIncomplete},
 		},
 	}
 
@@ -694,7 +706,7 @@ func TestGetSuggestedCustomFields_DocumentLink(t *testing.T) {
 					{ID: 2, Name: "Reference", DataType: "documentlink"},
 				},
 				ReferenceMatches: tt.referenceMatches,
-				ReferenceError:   tt.referenceError,
+				ReferenceErrors:  tt.referenceErrors,
 			}
 			app := &App{LLM: llm, Client: client}
 

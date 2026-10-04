@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1302,31 +1303,115 @@ func TestLookupTagID_AmbiguousMatchIsDeterministic(t *testing.T) {
 	assert.False(t, exists)
 }
 
-// TestFindDocumentIDsByReference checks the request sent to paperless-ngx and
-// that the substring match of content__icontains is narrowed to whole words.
+// serveContentSearch answers /api/documents/ content searches from docs the
+// way paperless-ngx does: substring filter, then paginated with count.
+func serveContentSearch(t *testing.T, env *testEnv, docs []GetDocumentApiResponseResult) {
+	env.setMockResponse("/api/documents/", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		assert.Equal(t, "GET", r.Method)
+		assert.Equal(t, "id,content", q.Get("fields"))
+		assert.Equal(t, "id", q.Get("ordering"), "pagination needs a stable order")
+
+		var matches []GetDocumentApiResponseResult
+		for _, d := range docs {
+			if strings.Contains(strings.ToLower(d.Content), strings.ToLower(q.Get("content__icontains"))) {
+				matches = append(matches, d)
+			}
+		}
+		pageSize, err := strconv.Atoi(q.Get("page_size"))
+		require.NoError(t, err)
+		page, err := strconv.Atoi(q.Get("page"))
+		require.NoError(t, err)
+		from := min((page-1)*pageSize, len(matches))
+		to := min(page*pageSize, len(matches))
+
+		w.WriteHeader(http.StatusOK)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]interface{}{
+			"count":   len(matches),
+			"results": matches[from:to],
+		}))
+	})
+}
+
+// TestFindDocumentIDsByReference checks that the substring match of
+// content__icontains is narrowed to whole words.
 func TestFindDocumentIDsByReference(t *testing.T) {
 	env := newTestEnv(t)
 	defer env.teardown()
-
-	env.setMockResponse("/api/documents/", func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "GET", r.Method)
-		assert.Equal(t, "R123", r.URL.Query().Get("content__icontains"))
-		assert.Equal(t, "id,content", r.URL.Query().Get("fields"))
-		assert.Equal(t, "5", r.URL.Query().Get("page_size"))
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"count": 4, "results": [
-			{"id": 1, "content": "Rechnung R123 vom 01.09.2026"},
-			{"id": 2, "content": "Rechnung R1234 vom 02.09.2026"},
-			{"id": 3, "content": "Mahnung zu Rechnung r123."},
-			{"id": 4, "content": "Auftrag AR123"}
-		]}`))
+	serveContentSearch(t, env, []GetDocumentApiResponseResult{
+		{ID: 1, Content: "Rechnung R123 vom 01.09.2026"},
+		{ID: 2, Content: "Rechnung R1234 vom 02.09.2026"},
+		{ID: 3, Content: "Mahnung zu Rechnung r123."},
+		{ID: 4, Content: "Auftrag AR123"},
 	})
 
 	ids, err := env.client.FindDocumentIDsByReference(context.Background(), " R123 ", 5)
 	require.NoError(t, err)
 	assert.Equal(t, []int{1, 3}, ids)
+	assert.Equal(t, 1, env.requestCount)
 }
 
+// TestFindDocumentIDsByReference_FollowsPages checks that whole-word matches
+// behind a full page of substring-only matches are still found, so a generic
+// reference is not mistaken for a unique one.
+func TestFindDocumentIDsByReference_FollowsPages(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.teardown()
+
+	var docs []GetDocumentApiResponseResult
+	for i := 1; i <= referenceSearchPageSize; i++ {
+		docs = append(docs, GetDocumentApiResponseResult{ID: i, Content: fmt.Sprintf("Kundennummer R1234%d", i)})
+	}
+	for i := 101; i <= 104; i++ {
+		docs = append(docs, GetDocumentApiResponseResult{ID: i, Content: "Kundennummer R1234"})
+	}
+	serveContentSearch(t, env, docs)
+
+	ids, err := env.client.FindDocumentIDsByReference(context.Background(), "R1234", 5)
+	require.NoError(t, err)
+	assert.Equal(t, []int{101, 102, 103, 104}, ids)
+	assert.Equal(t, 2, env.requestCount)
+}
+
+// TestFindDocumentIDsByReference_StopsAtLimit checks that scanning stops as
+// soon as limit whole-word matches are found.
+func TestFindDocumentIDsByReference_StopsAtLimit(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.teardown()
+
+	var docs []GetDocumentApiResponseResult
+	for i := 1; i <= 3*referenceSearchPageSize; i++ {
+		docs = append(docs, GetDocumentApiResponseResult{ID: i, Content: "Kundennummer 0002058"})
+	}
+	serveContentSearch(t, env, docs)
+
+	ids, err := env.client.FindDocumentIDsByReference(context.Background(), "0002058", 5)
+	require.NoError(t, err)
+	assert.Equal(t, []int{1, 2, 3, 4, 5}, ids)
+	assert.Equal(t, 1, env.requestCount)
+}
+
+// TestFindDocumentIDsByReference_ScanBudgetExceeded checks that the lookup
+// fails closed instead of returning a possibly partial result when there are
+// more substring matches than it is allowed to scan.
+func TestFindDocumentIDsByReference_ScanBudgetExceeded(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.teardown()
+
+	var docs []GetDocumentApiResponseResult
+	for i := 1; i <= referenceSearchMaxPages*referenceSearchPageSize+1; i++ {
+		docs = append(docs, GetDocumentApiResponseResult{ID: i, Content: fmt.Sprintf("Vorgang R1234%d", i)})
+	}
+	serveContentSearch(t, env, docs)
+
+	ids, err := env.client.FindDocumentIDsByReference(context.Background(), "R1234", 5)
+	require.ErrorIs(t, err, errReferenceSearchIncomplete)
+	assert.Nil(t, ids)
+	assert.Equal(t, referenceSearchMaxPages, env.requestCount)
+}
+
+// TestFindDocumentIDsByReference_EmptyReference checks that a blank reference
+// returns no matches without querying paperless-ngx.
 func TestFindDocumentIDsByReference_EmptyReference(t *testing.T) {
 	env := newTestEnv(t)
 	defer env.teardown()

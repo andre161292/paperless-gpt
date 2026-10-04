@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image/jpeg"
 	"io"
@@ -92,6 +93,19 @@ func (client *PaperlessClient) SearchDocuments(ctx context.Context, query string
 	return documents, nil
 }
 
+const (
+	// referenceSearchPageSize is the page size used while scanning substring
+	// matches for whole-word ones.
+	referenceSearchPageSize = 25
+	// referenceSearchMaxPages bounds how many substring matches are scanned
+	// for a single reference.
+	referenceSearchMaxPages = 4
+)
+
+// errReferenceSearchIncomplete is returned when the scan budget ran out
+// before it was clear how many documents contain a reference as a whole word.
+var errReferenceSearchIncomplete = errors.New("too many partial matches to determine whole-word matches")
+
 // FindDocumentIDsByReference returns the ids of up to limit documents whose
 // content contains reference as a whole word (case-insensitive), e.g. an
 // invoice number cited by a reminder.
@@ -99,42 +113,72 @@ func (client *PaperlessClient) SearchDocuments(ctx context.Context, query string
 // It uses the plain content__icontains filter rather than full-text search:
 // it matches identifiers exactly, behaves the same across paperless-ngx
 // versions and does not depend on the search index being up to date. The
-// substring match is then narrowed to whole words, so "R123" does not match
-// "R1234".
+// substring matches are then narrowed to whole words, so "R123" does not
+// match "R1234".
+//
+// The result is complete: fewer than limit ids means no other document
+// matches. Because substring-only matches can push whole-word matches onto
+// later pages, pages are scanned until limit ids are found or all candidates
+// were checked. If that takes more than referenceSearchMaxPages pages,
+// errReferenceSearchIncomplete is returned rather than a possibly partial
+// result.
 func (client *PaperlessClient) FindDocumentIDsByReference(ctx context.Context, reference string, limit int) ([]int, error) {
 	reference = strings.TrimSpace(reference)
-	if reference == "" {
+	if reference == "" || limit <= 0 {
 		return nil, nil
 	}
 
-	path := fmt.Sprintf("api/documents/?content__icontains=%s&fields=id,content&page_size=%d", url.QueryEscape(reference), limit)
+	wholeWord := regexp.MustCompile(`(?i)(^|[^\p{L}\p{N}])` + regexp.QuoteMeta(reference) + `($|[^\p{L}\p{N}])`)
+	var ids []int
+	for page := 1; ; page++ {
+		if page > referenceSearchMaxPages {
+			return nil, fmt.Errorf("reference %q: %w", reference, errReferenceSearchIncomplete)
+		}
+
+		documentsResponse, err := client.searchDocumentsByContent(ctx, reference, page)
+		if err != nil {
+			return nil, err
+		}
+		for _, result := range documentsResponse.Results {
+			if wholeWord.MatchString(result.Content) {
+				ids = append(ids, result.ID)
+				if len(ids) == limit {
+					return ids, nil
+				}
+			}
+		}
+
+		if page*referenceSearchPageSize >= documentsResponse.Count || len(documentsResponse.Results) == 0 {
+			return ids, nil
+		}
+	}
+}
+
+// searchDocumentsByContent fetches one page of documents whose content
+// contains text (case-insensitive substring), returning only id and content.
+func (client *PaperlessClient) searchDocumentsByContent(ctx context.Context, text string, page int) (GetDocumentsApiResponse, error) {
+	var documentsResponse GetDocumentsApiResponse
+
+	path := fmt.Sprintf("api/documents/?content__icontains=%s&fields=id,content&ordering=id&page_size=%d&page=%d",
+		url.QueryEscape(text), referenceSearchPageSize, page)
 	resp, err := client.Do(ctx, "GET", path, nil)
 	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed in FindDocumentIDsByReference: %w", err)
+		return documentsResponse, fmt.Errorf("HTTP request failed in searchDocumentsByContent: %w", err)
 	}
 	defer resp.Body.Close()
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return documentsResponse, fmt.Errorf("failed to read response body: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("error searching documents by reference: status=%d, body=%s", resp.StatusCode, string(bodyBytes))
+		return documentsResponse, fmt.Errorf("error searching documents by content: status=%d, body=%s", resp.StatusCode, string(bodyBytes))
 	}
 
-	var documentsResponse GetDocumentsApiResponse
 	if err := json.Unmarshal(bodyBytes, &documentsResponse); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON response: %w", err)
+		return documentsResponse, fmt.Errorf("failed to parse JSON response: %w", err)
 	}
-
-	wholeWord := regexp.MustCompile(`(?i)(^|[^\p{L}\p{N}])` + regexp.QuoteMeta(reference) + `($|[^\p{L}\p{N}])`)
-	var ids []int
-	for _, result := range documentsResponse.Results {
-		if wholeWord.MatchString(result.Content) {
-			ids = append(ids, result.ID)
-		}
-	}
-	return ids, nil
+	return documentsResponse, nil
 }
 
 // GetDocumentPageImage renders one page of a document as a JPEG for the

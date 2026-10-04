@@ -547,7 +547,13 @@ func (app *App) getSuggestedCustomFields(ctx context.Context, doc Document, sele
 		}
 		value := llmField.Value
 		if field.DataType == documentLinkFieldType {
-			linkedIDs := app.resolveDocumentLinks(ctx, doc.ID, value, logger)
+			linkedIDs, err := app.resolveDocumentLinks(ctx, doc.ID, value, logger)
+			if err != nil {
+				// A partial link list must never replace the existing value
+				// (write modes "update" and "replace"), so leave the field alone.
+				logger.Warnf("Resolving document links for custom field '%s' failed, skipping the field: %v", field.Name, err)
+				continue
+			}
 			if len(linkedIDs) == 0 {
 				logger.Infof("None of the references %v for custom field '%s' matched another document, skipping the field.", value, field.Name)
 				continue
@@ -567,9 +573,13 @@ func (app *App) getSuggestedCustomFields(ctx context.Context, doc Document, sele
 // resolveDocumentLinks turns the references the LLM extracted for a
 // documentlink field into the ids of the documents they identify. A reference
 // is only linked if it matches between one and maxDocumentLinkMatches other
-// documents; references that match nothing or are too generic are dropped, as
-// are lookup errors, so a bad reference never fails the whole document.
-func (app *App) resolveDocumentLinks(ctx context.Context, documentID int, value interface{}, logger *logrus.Entry) []int {
+// documents; references that match nothing or are too generic are dropped.
+//
+// If any lookup fails, an error is returned instead of the links resolved so
+// far: the caller would otherwise write an incomplete link list over the
+// field's existing value. The document itself is still processed, just
+// without this field.
+func (app *App) resolveDocumentLinks(ctx context.Context, documentID int, value interface{}, logger *logrus.Entry) ([]int, error) {
 	var linkedIDs []int
 	for _, reference := range documentLinkReferences(value) {
 		if len([]rune(reference)) < minDocumentLinkReferenceLength {
@@ -578,11 +588,11 @@ func (app *App) resolveDocumentLinks(ctx context.Context, documentID int, value 
 		}
 
 		// One extra result for the document itself and one more to tell
-		// whether the reference matches too many documents.
+		// whether the reference matches too many documents. The result is
+		// complete up to that limit, so the count below is reliable.
 		ids, err := app.Client.FindDocumentIDsByReference(ctx, reference, maxDocumentLinkMatches+2)
 		if err != nil {
-			logger.Warnf("Looking up document link reference %q failed, skipping it: %v", reference, err)
-			continue
+			return nil, fmt.Errorf("looking up reference %q: %w", reference, err)
 		}
 		ids = slices.DeleteFunc(ids, func(id int) bool { return id == documentID })
 
@@ -599,7 +609,7 @@ func (app *App) resolveDocumentLinks(ctx context.Context, documentID int, value 
 			}
 		}
 	}
-	return linkedIDs
+	return linkedIDs, nil
 }
 
 // documentLinkReferences normalizes the LLM's value for a documentlink field
